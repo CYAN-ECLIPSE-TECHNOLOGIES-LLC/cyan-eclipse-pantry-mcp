@@ -708,25 +708,101 @@ def t_receipt_list(state, args):
 
 
 TOOLS = {
-    "dex_ingest": (t_dex_ingest, "Ingest a DEX/UCS-style telemetry export from a LOCAL file. Fail-closed: malformed content, a PAN-shaped value anywhere in the file (PAN_DETECTED — card data has no field here), an unenrolled machine, or a serial mismatch rejects the whole ingest with the reason named; rejections are receipted too. Returns the normalized read summary with provenance.",
-                   {"path": {"type": "string"}}, ["path"]),
-    "inventory_read": (t_inventory_read, "Tier 0: product-level stock per enrolled machine from its latest telemetry read, with read age and a stale flag (>48h). Omit machine_id for the whole enrolled fleet; unenrolled machines are invisible.",
-                       {"machine_id": {"type": "string"}, "as_of": {"type": "string"}}, []),
-    "sales_summary": (t_sales_summary, "Tier 0: sales aggregates from DEX counters — vends, gross, and the cash vs cashless split (processor aggregates only; no card data exists in this system). Default: cumulative since counter reset, latest read per machine. With since+until (YYYY-MM-DD): deltas between the reads bracketing the period.",
-                      {"machine_id": {"type": "string"}, "since": {"type": "string"}, "until": {"type": "string"}}, []),
-    "stockout_forecast": (t_stockout_forecast, "Tier 0: days-to-empty per selection from measured sales velocity (delta between the two latest reads, else cumulative since reset) — a labeled heuristic. Flags selections stocked out or emptying within horizon_days (default 7).",
-                          {"machine_id": {"type": "string"}, "horizon_days": {"type": "number"}}, []),
-    "fault_read": (t_fault_read, "Tier 0: fault/event records from each machine's latest DEX read, with labels and severity. Reports only — no tickets, no dispatch (C1).",
-                   {"machine_id": {"type": "string"}}, []),
-    "receipt_list": (t_receipt_list, "The append-only, hash-chained receipt ledger: every ingest (accepted, duplicate, rejected) and every read verdict. Optional type filter and limit; reports chain validity.",
-                     {"type": {"type": "string"}, "limit": {"type": "integer"}}, []),
+    "dex_ingest": (t_dex_ingest, "Ingest one DEX/UCS-style vending telemetry export from a local file into the stored read snapshots for its machine. Use when a new audit export file arrives; use inventory_read, sales_summary, stockout_forecast, or fault_read to read data already ingested. Mutating and persistent on success: appends the normalized snapshot to that machine's reads in the state file and appends a hash-chained dex_ingest receipt. Fail-closed — the whole file is rejected and nothing is stored when: the file does not exist (FILE_NOT_FOUND); any line is malformed (DEX_PARSE_ERROR, with the 1-based line number named); a Luhn-valid 13-19 digit card-number-shaped value appears anywhere in the file (PAN_DETECTED — the ingest has no field for card data, and the value is never stored, logged, or echoed, only its line number is recorded); the machine named in the file is not in the Machine Registry (MACHINE_NOT_ENROLLED — unenrolled machines are invisible, and enrollment is an operator edit of the registry file, never an agent action); or the file's DEX serial differs from the registry serial for that machine (SERIAL_MISMATCH). Every rejection is receipted too and returns normally with status 'rejected' and the code named, rather than raising. Re-ingesting a read with the same audit counter and collection time returns status 'duplicate_ignored' and changes nothing beyond its receipt. No network call of any kind is made; the file is read from local disk only, and there is no authentication or rate limiting. Returns {status, receipt_seq} plus, on success, machine_id, type, location, read_at, reset_at, audit_counter, selections (a count), totals {vends, gross_cents}, cash, events (a count), and provenance; on rejection, code and error instead, plus line when the failure is line-specific.",
+                   {"path": {"type": "string", "description": "Path to the local DEX export file to ingest, read from disk only. The file must be an asterisk-delimited DEX/UCS-style export that opens with a DXS header record and closes with a DXE trailer."}}, ["path"]),
+    "inventory_read": (t_inventory_read, "Read current per-selection stock levels for enrolled vending machines from each machine's latest ingested telemetry snapshot. Use for what-is-in-the-machine and what-is-running-low questions; use sales_summary for sales totals, stockout_forecast for days-to-empty predictions, and fault_read for machine faults instead. Tier 0 telemetry read: it never changes stored snapshots, actuates nothing, prices nothing, and places no orders — its only write is appending its own inventory_read audit receipt to the hash-chained ledger. Each selection row carries inventory, capacity, the computed fill_pct, product name and price_cents, and the snapshot's provenance; each machine carries read_at, age_hours measured against as_of, and a stale flag — reads older than 48 hours are labelled stale, never silently treated as fresh. A machine that is enrolled but has no read yet returns a note instead of selections. Asking for an unenrolled machine_id is an error; unenrolled machines are otherwise invisible. No network, no authentication, no rate limits. Returns {machines, count, receipt_seq, note}.",
+                       {"machine_id": {"type": "string", "description": "Optional enrolled machine id, e.g. 'DRINK-01', to read just that machine. Omit to read every enrolled machine. An unenrolled id is an error."},
+                        "as_of": {"type": "string", "description": "Optional reference moment for the staleness calculation: 'YYYY-MM-DD' (treated as the end of that day) or a full ISO datetime. Defaults to the current local time. An unparseable value is an error."}}, []),
+    "sales_summary": (t_sales_summary, "Summarize vending sales from stored DEX counters — vends, gross value, and the cash versus cashless split — per machine and fleet-wide. Use for revenue and volume questions; use inventory_read for stock levels and stockout_forecast for emptying predictions instead. Tier 0 telemetry read: it changes no stored snapshot and its only write is its own sales_summary audit receipt. Amounts are machine and processor aggregates taken from the counters — no card data exists anywhere in this system. Without since and until, each machine reports cumulative counters since its counter reset, from its latest read (mode 'cumulative_since_reset'). With both since and until given, it reports the delta between the reads bracketing the period (mode 'period_delta'), falling back to cumulative figures when the stored reads cannot bracket the period; supplying only one of since/until is treated as no period at all. Machines with no ingested reads are skipped silently. Cash figures are {cash_cents, cashless_cents, cashless_count}, and each machine row and the totals carry cashless_share_pct (null when the relevant total is zero). No network, no authentication. Returns {machines, totals, receipt_seq, note}, where totals sums vends, gross_cents, and the cash fields across the reported machines.",
+                      {"machine_id": {"type": "string", "description": "Optional enrolled machine id to summarize just that machine. Omit for all enrolled machines. An unenrolled id is an error."},
+                       "since": {"type": "string", "description": "Optional period start, 'YYYY-MM-DD'. Takes effect only together with until: the delta is computed between the latest read at or before the period start and the latest read at or before until, when the stored reads allow it."},
+                       "until": {"type": "string", "description": "Optional period end, 'YYYY-MM-DD', inclusive at end of day. Takes effect only together with since."}}, []),
+    "stockout_forecast": (t_stockout_forecast, "Forecast days-to-empty for every selection of enrolled machines from measured sales velocity, flagging selections already stocked out or projected to empty within the horizon. Use for restock-risk questions; use inventory_read for current stock without prediction and sales_summary for sales totals instead. Tier 0 telemetry read: it changes no stored snapshot, plans no route, and places no order — its only write is its own stockout_forecast audit receipt. Method, stated per selection: with two or more stored reads, velocity is the vend delta between the two latest reads divided by the days between them (method 'delta_between_reads'); with a single read, velocity is cumulative vends since the counter reset divided by the days since that reset (method 'cumulative_since_reset'). days_to_empty is current inventory divided by that velocity under a constant-rate assumption, and is null — with an explicit no-forecast note on the row — when velocity is zero or unmeasurable; every forecasted row is labelled a heuristic prediction, not a guarantee. Machines with no ingested reads are skipped. No network, no authentication. Returns {machines, at_risk_count, receipt_seq, note}, with each machine's selections sorted soonest-to-empty first and no-forecast rows last.",
+                          {"machine_id": {"type": "string", "description": "Optional enrolled machine id to forecast just that machine. Omit for all enrolled machines. An unenrolled id is an error."},
+                           "horizon_days": {"type": "number", "description": "Days ahead that define 'at risk': a selection whose days_to_empty is at or below this value is flagged at_risk. Default 7. A stocked-out selection has days_to_empty 0 and is flagged whenever its velocity is measurable."}}, []),
+    "fault_read": (t_fault_read, "Read fault and event records from each enrolled machine's latest ingested telemetry snapshot, with a human label and a severity for each code. Use for machine-health questions; use inventory_read for stock and sales_summary for sales instead — this tool reports faults only and, in this build, creates no service ticket and dispatches nobody. Tier 0 telemetry read: it changes no stored snapshot and its only write is its own fault_read audit receipt. Known codes and severities: TEMP_HIGH and MOTOR_FAIL are high; JAM, COIN_JAM, and BILL_VAL are medium; SOLD_OUT and DOOR_OPEN are low; an unrecognized code is returned with the raw code as its label and severity 'info'. Each event carries its code, occurred_at timestamp, and occurrence count, and each machine block carries the snapshot's provenance. Machines with no ingested read are skipped; asking for an unenrolled machine_id is an error. No network, no authentication. Returns {machines, event_count, receipt_seq, note}, where event_count totals the events across all returned machines.",
+                   {"machine_id": {"type": "string", "description": "Optional enrolled machine id to read faults for just that machine. Omit for all enrolled machines. An unenrolled id is an error."}}, []),
+    "receipt_list": (t_receipt_list, "Read the append-only, hash-chained receipt ledger covering every ingest (accepted, duplicate, and rejected) and every telemetry-read verdict, and report whether the chain still verifies. Use to audit what was ingested or read, and in what order; use the telemetry tools themselves for stock, sales, forecast, or fault data. Read-only and deliberately not receipted itself — it is the audit reader, so calling it adds nothing to the ledger. Receipts record event types, machine ids, audit counters, and rejection codes; a PAN rejection receipt records only the line number, never the card-shaped value. Returns {receipts, count, chain_valid, note}: receipts are chronological, count is the number matching the optional type filter before limit is applied, and chain_valid verifies the full unfiltered ledger. Defaults to the most recent 50 receipts.",
+                     {"type": {"type": "string", "description": "Optional exact receipt-type filter, e.g. 'dex_ingest', 'dex_ingest_rejected', 'dex_ingest_duplicate', 'inventory_read', 'sales_summary', 'stockout_forecast', or 'fault_read'. Omit to return all types."},
+                      "limit": {"type": "integer", "description": "Maximum number of receipts to return, taken from the end of the filtered list so the most recent are kept. Integer, default 50."}}, []),
+}
+
+TOOL_ANNOTATIONS = {
+    "dex_ingest": {"readOnlyHint": False, "destructiveHint": False,
+                   "idempotentHint": False, "openWorldHint": False},
+    "inventory_read": {"readOnlyHint": False, "destructiveHint": False,
+                       "idempotentHint": False, "openWorldHint": False},
+    "sales_summary": {"readOnlyHint": False, "destructiveHint": False,
+                      "idempotentHint": False, "openWorldHint": False},
+    "stockout_forecast": {"readOnlyHint": False,
+                          "destructiveHint": False,
+                          "idempotentHint": False,
+                          "openWorldHint": False},
+    "fault_read": {"readOnlyHint": False, "destructiveHint": False,
+                   "idempotentHint": False, "openWorldHint": False},
+    "receipt_list": {"readOnlyHint": True, "destructiveHint": False,
+                     "idempotentHint": True, "openWorldHint": False},
+}
+
+TOOL_OUTPUT_SCHEMAS = {
+    "dex_ingest": {"type": "object", "properties": {
+        "status": {"type": "string"},
+        "code": {"type": "string"},
+        "error": {"type": "string"},
+        "line": {"type": ["integer", "null"]},
+        "machine_id": {"type": "string"},
+        "type": {"type": "string"},
+        "location": {"type": "string"},
+        "read_at": {"type": "string"},
+        "reset_at": {"type": "string"},
+        "audit_counter": {"type": "integer"},
+        "selections": {"type": "integer"},
+        "totals": {"type": "object"},
+        "cash": {"type": "object"},
+        "events": {"type": "integer"},
+        "provenance": {"type": "object"},
+        "note": {"type": "string"},
+        "receipt_seq": {"type": "integer"}},
+        "required": ["status", "receipt_seq"]},
+    "inventory_read": {"type": "object", "properties": {
+        "machines": {"type": "array", "items": {"type": "object"}},
+        "count": {"type": "integer"},
+        "receipt_seq": {"type": "integer"},
+        "note": {"type": "string"}},
+        "required": ["machines", "count", "receipt_seq", "note"]},
+    "sales_summary": {"type": "object", "properties": {
+        "machines": {"type": "array", "items": {"type": "object"}},
+        "totals": {"type": "object"},
+        "receipt_seq": {"type": "integer"},
+        "note": {"type": "string"}},
+        "required": ["machines", "totals", "receipt_seq", "note"]},
+    "stockout_forecast": {"type": "object", "properties": {
+        "machines": {"type": "array", "items": {"type": "object"}},
+        "at_risk_count": {"type": "integer"},
+        "receipt_seq": {"type": "integer"},
+        "note": {"type": "string"}},
+        "required": ["machines", "at_risk_count", "receipt_seq", "note"]},
+    "fault_read": {"type": "object", "properties": {
+        "machines": {"type": "array", "items": {"type": "object"}},
+        "event_count": {"type": "integer"},
+        "receipt_seq": {"type": "integer"},
+        "note": {"type": "string"}},
+        "required": ["machines", "event_count", "receipt_seq", "note"]},
+    "receipt_list": {"type": "object", "properties": {
+        "receipts": {"type": "array", "items": {"type": "object"}},
+        "count": {"type": "integer"},
+        "chain_valid": {"type": "boolean"},
+        "note": {"type": "string"}},
+        "required": ["receipts", "count", "chain_valid", "note"]},
 }
 
 
 def tool_list():
     return [{"name": name, "description": desc,
              "inputSchema": {"type": "object", "properties": props,
-                             "required": req}}
+                             "required": req},
+             "outputSchema": TOOL_OUTPUT_SCHEMAS[name],
+             "annotations": TOOL_ANNOTATIONS[name]}
             for name, (_, desc, props, req) in TOOLS.items()]
 
 
